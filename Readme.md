@@ -1,8 +1,8 @@
-# Title: PostgreSQL + Outbox Pattern Revamped — Part 2
+# PostgreSQL + Outbox Pattern Revamped — Part 2
 
 [Part 1 of this series](https://dev.to/msdousti/postgresql-outbox-pattern-revamped-part-1-3lai/) introduced the outbox pattern as a reliable approach for message delivery in distributed systems, while highlighting several implementation pitfalls that can lead to failures. These include sorting by `created_at`, incorrect data types, suboptimal indexing, overly large batch selections, poison pill messages, and inefficient index or visibility checks. A key insight was the performance impact of stale indexes, especially in high-throughput systems. To address this, the post proposed a revamped design using partitioned tables, which simplifies cleanup and mitigates visibility issues. Below is a summary of the traditional vs. revamped design, along with the DDL for both. Throughout this article, we will use the red color to indicate the traditional design and the blue color for the revamped design. Notice the update to the `published_at` column of the `outbox_unpublished` partition causes the record to be deleted from it and inserted into the `outbox_published` partition, which is a key feature of the revamped design.
 
-![Traditional vs. revamped outbox](old-vs-new-outbox.png)
+![Traditional vs. revamped outbox](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/old-vs-new-outbox.png)
 
 Traditional (non-partitioned) outbox table:
 ```sql
@@ -42,7 +42,21 @@ CREATE INDEX outbox_new_unpublished_id_idx
 
 Although this approach is easily applicable to new systems, applying it to existing databases is less straightforward due to PostgreSQL's limitations around retrofitting table partitioning.
 
-In this second part, we will first explore design patterns for migration from a "traditional" outbox table to a partitioned one. We cover five scenarios and for each scenario, introduce a migration pattern. Next, we will pertain to the `autovacuum` settings for the outbox tables, and how to tune them for optimal performance. Finally, we will discuss index maintenance for the outbox tables, which is crucial for high-throughput systems.
+In this second part, we will first explore migration patterns from a "traditional" outbox table to a partitioned one. We cover five scenarios and for each scenario, introduce a migration pattern. Next, we will pertain to the `autovacuum` settings for the outbox tables, and how to tune them for optimal performance. Finally, we will discuss index maintenance for the outbox tables, which is crucial for high-throughput systems.
+
+# Table of Contents
+```text
+Outbox migration patterns
+  * COP: Cold Outbox Partitioning
+  * COPRA: Cold Outbox Partitioning w/ Rapid Attachment
+  * HOP: Hot Outbox Partitioning
+  * HOPER: Hot Outbox Partitioning w/ Eventual Replacement
+  * HOPIA: Hot Outbox Partitioning w/ Immediate Access
+Tuning AUTOVACUUM for outbox tables
+Outbox table index maintenance
+Conclusion
+```
+
 
 # Outbox migration patterns
 Let's consider the scenario that we have an existing service with a traditional outbox table, and we want to migrate to a partitioned outbox table. We will use some schematics to illustrate the migration process, and assume a rolling update approach where the new version of the service is deployed alongside the old one, and they co-exist for a while. This is the most common scenario in production systems, where we cannot afford downtime or data loss. Depending on the requirements, we may have to deploy several versions of the service. The services will be denoted by the green color, and the version number like `V1`, `V2`, etc.
@@ -57,7 +71,7 @@ Below, I will describe five patterns for migrating the outbox table, in the incr
 
 The decision flowchart below can help you choose the right pattern for your requirements. The next sections will describe each pattern in detail.
 
-![Deciding what pattern to use](flowchart.png)
+![Deciding what pattern to use](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/flowchart.png)
 
 ## COP: Cold Outbox Partitioning
 COP is the simplest pattern for migration from a traditional outbox table to a partitioned one. The requirements are as relaxed as possible:
@@ -69,15 +83,15 @@ An example is a service that periodically uses the outbox. For instance, in our 
 Given these requirements, the migration process is straightforward:
 1. `V1` is using the traditional outbox table.
 2. `V2` is deployed with the new partitioned outbox table:
-    * Insertions are now made into the **new** partitioned outbox table.
-    * Publication continues from the **old** outbox table, until there are no more messages to publish.
+   * Insertions are now made into the **new** partitioned outbox table.
+   * Publication continues from the **old** outbox table, until there are no more messages to publish.
 3. `V3` is deployed where both insertions and publication are now performed over the **new** partitioned outbox table.
 
 Between the `V2` and `V3` deployments, there is a short period where unpublished messages accumulated in the `outbox_unpublished` table, and as such the publication is effectively paused.
 
 Let's depict this process in a schematic. Notice that due to the rolling deployment, `V1` and `V2` co-exist for a while, and the same applies to `V2` and `V3`. However, `V1` and `V3` do not co-exist. Also, `V3` is only deployed after all messages in the old `outbox` table are published. To prevent name clashes, let's assume that the new partitioned outbox table is named `outbox_new`.
 
-![The COP migration pattern](cop.png)
+![The COP migration pattern](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/cop.png)
 
 ## COPRA: Cold Outbox Partitioning w/ Rapid Attachment
 COPRA is the second-simplest pattern—after COP—for migration from a traditional outbox table to a partitioned one. The requirement on paused publication is the same as before, but the existing data in the old outbox table is needed to be available in the new partitioned setup:
@@ -124,7 +138,7 @@ ALTER TABLE outbox_new
 You may also want to change or drop the indexes on the old outbox table (e.g., the primary key). A crucial point here, according to the [PostgreSQL documentation](https://www.postgresql.org/docs/current/ddl-partitioning.html), is as follows:
 
 > Note that when running the `ATTACH PARTITION` command, the table will be scanned to validate the partition constraint while holding an `ACCESS EXCLUSIVE` lock on that partition.
-> 
+>
 > It is recommended to avoid this scan by creating a `CHECK` constraint matching the expected partition constraint on the table prior to attaching it. Once the `ATTACH PARTITION` is complete, it is recommended to drop the now-redundant `CHECK` constraint.
 
 In the above example, the `outbox` table will be locked exclusively, to check that it satisfies the condition of being the `DEFAULT` partition of the `outbox_new` table. This means that all the rows must satisfy the condition `published_at IS NOT NULL`. If the outbox table is large, this can take a considerable amount of time. It can be OK if:
@@ -167,7 +181,7 @@ According to the above discussion, the migration process is as follows:
 
 The schematics below illustrate the COPRA migration pattern.
 
-![The COPRA migration pattern](copra.png)
+![The COPRA migration pattern](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/copra.png)
 
 ## HOP: Hot Outbox Partitioning
 HOP is the first pattern for migration from a traditional outbox table to a partitioned one, where we cannot afford to pause the publication of messages. The requirements are as follows:
@@ -226,7 +240,7 @@ END $$;
 ```
 
 The schematics below illustrate the HOP migration pattern.
-![The HOP migration pattern](hop.png)
+![The HOP migration pattern](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/hop.png)
 
 ## HOPER: Hot Outbox Partitioning w/ Eventual Replacement
 HOPER is a migration pattern for the following requirements:
@@ -250,7 +264,7 @@ The steps are a combination of the HOP and COPRA patterns:
 
 
 The schematics below illustrate the HOPER migration pattern.
-![The HOPER migration pattern](hoper.png)
+![The HOPER migration pattern](https://raw.githubusercontent.com/msdousti/outbox2/refs/heads/main/hoper.png)
 
 ## HOPIA: Hot Outbox Partitioning w/ Immediate Access
 HOPIA is the migration pattern for the strictest requirements:
@@ -360,30 +374,40 @@ CREATE INDEX outbox_new_unpublished_id_idx
     ON outbox_unpublished (id);
 ```
 
-The `outbox_unpublished` partition is frequently inserted to and updated (resulting in delete), so the index on it is supposed to be severely bloated over time. We'll use the `pgstattuple` extension to monitor the index bloat. It's a heavy operation, so do not do it in production.
+The `outbox_unpublished` partition is frequently inserted to and updated (resulting in delete), so the index on it is supposed to be severely bloated over time. We'll use [this nice script](https://raw.githubusercontent.com/ioguix/pgsql-bloat-estimation/refs/heads/master/btree/btree_bloat-superuser.sql) by ioguix to estimate the bloat of the B-Tree index. The script requires superuser privileges to run, since it accesses the `pg_statistic` system catalog.
 
+Let's create a view to simplify the usage of the script. In order not to clutter the blog, I will not paste the entire 90+ line script here, but you can find it in the link above.
 ```sql
-CREATE EXTENSION IF NOT EXISTS pgstattuple;
+CREATE OR REPLACE VIEW bloat AS
+-- put btree_bloat-superuser.sql here
+;
 ```
+
 
 On a freshly created `outbox_unpublished` partition, the following query shows that the index is empty, thus not bloated at all:
 ```sql
-SELECT * FROM pgstatindex('outbox_new_unpublished_id_idx') \gx
+-- Update the statistics of the outbox_unpublished partition.
+ANALYZE outbox_unpublished;
+
+SELECT * FROM bloat WHERE idxname='outbox_new_unpublished_id_idx' \gx
 ```
 
 ```text
--[ RECORD 1 ]------+-----
-version            | 4
-tree_level         | 0
-index_size         | 8192
-root_block_no      | 0
-internal_pages     | 0
-leaf_pages         | 0
-empty_pages        | 0
-deleted_pages      | 0
-avg_leaf_density   | NaN
-leaf_fragmentation | NaN
+-[ RECORD 1 ]----+------------------------------
+current_database | postgres
+schemaname       | public
+tblname          | outbox_unpublished
+idxname          | outbox_new_unpublished_id_idx
+real_size        | 8192
+extra_size       | 0
+extra_pct        | 0
+fillfactor       | 90
+bloat_size       | 0
+bloat_pct        | 0
+is_na            | f
 ```
+
+Column `bloat_pct` is the bloat percentage of the index, which is 0% in this case, meaning that the index is not bloated at all. `is_na` is the estimation "Not Applicable?" If true, do not trust the stats. In this case, it is false, meaning that the stats are valid and applicable.
 
 Let's insert 100K rows into the `outbox_new` table, and see how the index looks like after that.
 
@@ -392,66 +416,111 @@ INSERT INTO outbox_new (payload)
 SELECT '{}'
 FROM generate_series(1, 100_000);
 
-SELECT * FROM pgstatindex('outbox_new_unpublished_id_idx') \gx
+ANALYZE outbox_unpublished;
+
+SELECT * FROM bloat WHERE idxname='outbox_new_unpublished_id_idx' \gx
 ```
 
 ```text
--[ RECORD 1 ]------+--------
-version            | 4
-tree_level         | 1
-index_size         | 2260992
-root_block_no      | 3
-internal_pages     | 1
-leaf_pages         | 274
-empty_pages        | 0
-deleted_pages      | 0
-avg_leaf_density   | 89.83
-leaf_fragmentation | 0
+-[ RECORD 1 ]----+------------------------------
+current_database | postgres
+schemaname       | public
+tblname          | outbox_unpublished
+idxname          | outbox_new_unpublished_id_idx
+real_size        | 2260992
+extra_size       | 237568
+extra_pct        | 10.507246376811594
+fillfactor       | 90
+bloat_size       | 8192
+bloat_pct        | 0.36231884057971014
+is_na            | f
 ```
 
-As you can see, `avg_leaf_density` is almost at 90%, which is the default fillfactor for B-Tree indexes in PostgreSQL. This means that the index is filled to the maximum capacity, and there is no bloat yet.
+Column `bloat_pct` is less than 0.4%, meaning that the index is still not bloated at all.
 
-Let's update the `published_at` column of all the rows, and see how the index looks like after that.
+Let's update the `published_at` column of 10K rows, and see how the index looks like after that.
+
+```sql
+UPDATE outbox_new
+SET published_at = NOW()
+WHERE published_at IS NULL
+AND id < (SELECT MIN(id) FROM outbox_new WHERE published_at IS NULL) + 10_000;
+
+ANALYZE outbox_unpublished;
+
+SELECT * FROM bloat WHERE idxname='outbox_new_unpublished_id_idx' \gx
+```
+
+```text
+-[ RECORD 1 ]----+------------------------------
+current_database | postgres
+schemaname       | public
+tblname          | outbox_unpublished
+idxname          | outbox_new_unpublished_id_idx
+real_size        | 2260992
+extra_size       | 434176
+extra_pct        | 19.202898550724637
+fillfactor       | 90
+bloat_size       | 237568
+bloat_pct        | 10.507246376811594
+is_na            | f
+```
+
+Now, the `bloat_pct` is 10.5%, meaning that the index is bloated by 10.5%. So, with 10K out of 100K rows updated, the index is bloated by 10.5%. Let's update the rest of rows:
 
 ```sql
 UPDATE outbox_new
 SET published_at = NOW()
 WHERE published_at IS NULL;
 
-SELECT * FROM pgstatindex('outbox_new_unpublished_id_idx') \gx
+ANALYZE outbox_unpublished;
+
+SELECT * FROM bloat WHERE idxname='outbox_new_unpublished_id_idx' \gx
 ```
 
 ```text
--[ RECORD 1 ]------+--------
-version            | 4
-tree_level         | 1
-index_size         | 2260992
-root_block_no      | 3
-internal_pages     | 1
-leaf_pages         | 274
-empty_pages        | 0
-deleted_pages      | 0
-avg_leaf_density   | 89.83
-leaf_fragmentation | 0
+-[ RECORD 1 ]----+------------------------------
+current_database | postgres
+schemaname       | public
+tblname          | outbox_unpublished
+idxname          | outbox_new_unpublished_id_idx
+real_size        | 2260992
+extra_size       | 2252800
+extra_pct        | 99.6376811594203
+fillfactor       | 90
+bloat_size       | 2252800
+bloat_pct        | 99.6376811594203
+is_na            | f
 ```
 
-Hm, nothing?! How can that be? The reason is that we ran the query `pgstatindex(..)` immediately after the update, and AUTOVACUUM didn't have a chance to run yet. If you run it after a few minutes (or after a manual `VACUUM`), you will see that the index is bloated:
+Wow, almost 100% bloat! Can `VACUUM (INDEX_CLEANUP on) outbox_new;` fix it? Try it, and you'll find the answer is no. What if we insert 10K new rows?
+
+```sql
+INSERT INTO outbox_new (payload)
+SELECT '{}'
+FROM generate_series(1, 10_000);
+
+ANALYZE outbox_unpublished;
+
+SELECT * FROM bloat WHERE idxname='outbox_new_unpublished_id_idx' \gx
+```
 
 ```text
--[ RECORD 1 ]------+--------
-version            | 4
-tree_level         | 1
-index_size         | 2260992
-root_block_no      | 3
-internal_pages     | 1
-leaf_pages         | 1
-empty_pages        | 0
-deleted_pages      | 273
-avg_leaf_density   | 0.05
-leaf_fragmentation | 0
+-[ RECORD 1 ]----+------------------------------
+current_database | postgres
+schemaname       | public
+tblname          | outbox_unpublished
+idxname          | outbox_new_unpublished_id_idx
+real_size        | 2482176
+extra_size       | 2269184
+extra_pct        | 91.41914191419141
+fillfactor       | 90
+bloat_size       | 2244608
+bloat_pct        | 90.42904290429043
+is_na            | f
 ```
 
-Only 5% of the index is leaf pages is used, which shows that the index is severely bloated. Notice that the (AUTO-)VACUUM did not remove the index bloat; it only marked them as invalid.
+Now, the `bloat_pct` is 90.4%, meaning the bloat is partially fixed, but still very high.
 
 Fortunately, it's easy to remove the index bloat by running a `REINDEX` command on the index or the table. To prevent an EXCLUSIVE lock on the table, you should use the `CONCURRENTLY` option, which will take longer but will not block other operations on the table. Since the `outbox_unpublished` partition is supposed to be small, the `REINDEX` command should not take too long:
 
